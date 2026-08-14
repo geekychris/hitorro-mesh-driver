@@ -62,4 +62,18 @@ public final class DistributedTableRegistry {
     public boolean isBroadcast(String name) {
         return broadcastNames.contains(name);
     }
+
+    /**
+     * Phase 6d.1 — names of registered tables whose underlying source is a
+     * stream (i.e. {@code table.streamConfig() != null}). Used by the
+     * planner to route windowed aggregates over these sources to the
+     * long-lived streaming plan instead of the batch two-stage plan.
+     */
+    public Set<String> streamingTableNames() {
+        Set<String> out = new LinkedHashSet<>();
+        for (DistributedTable t : tables.values()) {
+            if (t.streamConfig() != null) out.add(t.name());
+        }
+        return out;
+    }
 }

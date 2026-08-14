@@ -4,6 +4,7 @@
 package com.hitorro.mesh.driver;
 
 import com.hitorro.jsontypesystem.Type;
+import com.hitorro.jvssql.config.StreamConfig;
 
 import java.util.List;
 import java.util.Set;
@@ -25,6 +26,16 @@ public interface DistributedTable {
     Type type();
 
     List<Partition> partitions();
+
+    /**
+     * Phase 6d.1 — non-null iff this table's underlying source is a stream
+     * (Kafka topic, NATS JetStream subject, in-memory streaming table).
+     * Signals to the planner that windowed aggregates should be planned as
+     * a long-lived {@code StreamingSimplePlan} (single-agent, no cross-
+     * partition combine) instead of a batch {@code TwoStagePlan} which
+     * would buffer forever waiting for EOS. Default null → batch source.
+     */
+    default StreamConfig streamConfig() { return null; }
 
     /**
      * @param key unique partition ID within the table (e.g. {@code "shard-3"})

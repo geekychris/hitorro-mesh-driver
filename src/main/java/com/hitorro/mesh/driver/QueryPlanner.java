@@ -129,13 +129,32 @@ public final class QueryPlanner {
             Pattern.compile("\\b(COUNT|SUM|MIN|MAX|AVG)\\s*\\(\\s*(\\*|[^)]+?)\\s*\\)",
                     Pattern.CASE_INSENSITIVE);
 
-    /** Marker interface — {@link SimplePlan}, {@link TwoStagePlan}, {@link ShuffleJoinPlan}, or {@link ShuffleJoinAggregatePlan}. */
-    public sealed interface Plan permits SimplePlan, TwoStagePlan, ShuffleJoinPlan, ShuffleJoinAggregatePlan {
+    /** Marker interface — {@link SimplePlan}, {@link TwoStagePlan}, {@link ShuffleJoinPlan}, {@link ShuffleJoinAggregatePlan}, or {@link StreamingSimplePlan}. */
+    public sealed interface Plan permits SimplePlan, TwoStagePlan, ShuffleJoinPlan, ShuffleJoinAggregatePlan, StreamingSimplePlan {
         String tableName();
     }
 
     /** Union-at-driver plan for pure projection/filter queries. */
     public record SimplePlan(String tableName) implements Plan {}
+
+    /**
+     * Phase 6d.1 — long-lived streaming plan. Used when the source is a
+     * streaming {@link DistributedTable} AND the query is a windowed
+     * aggregate (has {@code WIN_START(...)} or similar in GROUP BY).
+     *
+     * <p>The agent runs the ORIGINAL SQL verbatim against the streaming
+     * source (with a {@link com.hitorro.jvssql.config.StreamConfig}
+     * registered so jvssql auto-picks the incremental
+     * {@code StreamingAggregate} executor). Windows flush as watermarks
+     * advance; rows emit continuously to the driver via ROW messages.
+     * No cross-partition combine at the driver — MVP is single-partition
+     * streaming aggregate (multi-partition needs incremental
+     * cross-partition combine, deferred to phase 6d.2).</p>
+     */
+    public record StreamingSimplePlan(
+            String tableName,
+            String originalSql
+    ) implements Plan {}
 
     /**
      * Shuffle-hash join plan (phase 4b): both sides are distributed tables
@@ -216,12 +235,19 @@ public final class QueryPlanner {
 
     /** Phase 1-3 compatibility overload — no broadcast, no distributed-table awareness. */
     public static Plan plan(String sql) {
-        return plan(sql, java.util.Set.of(), java.util.Set.of());
+        return plan(sql, java.util.Set.of(), java.util.Set.of(), java.util.Set.of());
     }
 
     /** Phase 4a compatibility overload — broadcast only, no shuffle-join. */
     public static Plan plan(String sql, java.util.Set<String> broadcastTables) {
-        return plan(sql, broadcastTables, java.util.Set.of());
+        return plan(sql, broadcastTables, java.util.Set.of(), java.util.Set.of());
+    }
+
+    /** Phase 4b compatibility overload — no streaming table awareness. */
+    public static Plan plan(String sql,
+                            java.util.Set<String> broadcastTables,
+                            java.util.Set<String> distributedTables) {
+        return plan(sql, broadcastTables, distributedTables, java.util.Set.of());
     }
 
     /**
@@ -230,16 +256,27 @@ public final class QueryPlanner {
      * @param distributedTables  names of registered distributed tables — JOIN
      *                           between two of them triggers the phase-4b
      *                           shuffle-hash path
+     * @param streamingTables    names of distributed tables backed by a
+     *                           streaming source. Windowed aggregates over
+     *                           these route to {@link StreamingSimplePlan}
+     *                           (phase 6d.1) instead of the batch
+     *                           {@link TwoStagePlan}.
      */
     public static Plan plan(String sql,
                             java.util.Set<String> broadcastTables,
-                            java.util.Set<String> distributedTables) {
+                            java.util.Set<String> distributedTables,
+                            java.util.Set<String> streamingTables) {
         Matcher hard = HARD_DISALLOWED.matcher(sql);
         if (hard.find()) {
             throw new IllegalArgumentException(
                     "mesh distribution does not yet support: " + hard.group(1)
                     + " — run this query on a single jvssql engine locally. sql=" + sql);
         }
+
+        // Phase 6d.1: streaming aggregate over a streaming source — route to
+        // the long-lived plan BEFORE hitting the batch two-stage detector.
+        java.util.Optional<StreamingSimplePlan> streaming = tryPlanStreamingAggregate(sql, streamingTables);
+        if (streaming.isPresent()) return streaming.get();
 
         // Phase 4b: detect fact-x-fact join BEFORE the broadcast-only guard.
         java.util.Optional<Plan> shuffleJoin =
@@ -474,6 +511,45 @@ public final class QueryPlanner {
     private static java.util.Optional<String> extractJoinChain(String sql) {
         Matcher m = JOIN_CHAIN.matcher(sql);
         return m.find() ? java.util.Optional.of(m.group(1).trim()) : java.util.Optional.empty();
+    }
+
+    /**
+     * Recognized windowing functions in the GROUP BY. Presence of any of
+     * these indicates a windowed aggregate — the phase-6d.1 streaming
+     * detector uses this to route to {@link StreamingSimplePlan} when the
+     * source is a streaming table.
+     */
+    private static final Pattern WINDOW_FUNC =
+            Pattern.compile("\\b(WIN_START|WIN_END|WIN_HOP_STARTS)\\s*\\(",
+                    Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Phase 6d.1 — try to plan a windowed aggregate over a streaming source.
+     * Present only if:
+     * <ul>
+     *   <li>The FROM table is in {@code streamingTables}</li>
+     *   <li>The GROUP BY contains a window function ({@code WIN_START} etc.)</li>
+     *   <li>No JOIN, no HAVING (MVP scope — those need multi-side plumbing)</li>
+     * </ul>
+     * The plan carries the ORIGINAL SQL — the agent runs it verbatim against
+     * a streaming-registered jvssql engine so windowed aggregates auto-swap
+     * to incremental emission.
+     */
+    private static java.util.Optional<StreamingSimplePlan> tryPlanStreamingAggregate(
+            String sql, java.util.Set<String> streamingTables) {
+        if (streamingTables.isEmpty()) return java.util.Optional.empty();
+        Matcher from = FROM_TABLE.matcher(sql);
+        if (!from.find()) return java.util.Optional.empty();
+        String tableName = from.group(1);
+        if (!streamingTables.contains(tableName)) return java.util.Optional.empty();
+        Matcher gb = HAS_GROUP_BY.matcher(sql);
+        if (!gb.find()) return java.util.Optional.empty();
+        if (!WINDOW_FUNC.matcher(gb.group(1)).find()) return java.util.Optional.empty();
+        // MVP scope: no JOIN, no HAVING — window semantics + join or HAVING
+        // over streaming needs cross-side plumbing not yet built.
+        if (JOIN_CHAIN.matcher(sql).find()) return java.util.Optional.empty();
+        if (HAVING_CLAUSE.matcher(sql).find()) return java.util.Optional.empty();
+        return java.util.Optional.of(new StreamingSimplePlan(tableName, sql));
     }
 
     /**

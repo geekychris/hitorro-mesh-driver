@@ -117,10 +117,17 @@ public final class QueryDispatcher {
         // (phase 4b), or simple/aggregate flavors (phases 1-3).
         java.util.Set<String> distributedNames = tables.all().stream()
                 .map(DistributedTable::name).collect(java.util.stream.Collectors.toSet());
-        QueryPlanner.Plan plan = QueryPlanner.plan(plannerSql, tables.broadcastNames(), distributedNames);
+        QueryPlanner.Plan plan = QueryPlanner.plan(plannerSql,
+                tables.broadcastNames(), distributedNames, tables.streamingTableNames());
 
         QueryHandle base;
-        if (plan instanceof QueryPlanner.ShuffleJoinAggregatePlan sjap) {
+        if (plan instanceof QueryPlanner.StreamingSimplePlan ssp) {
+            DistributedTable table = tables.get(ssp.tableName());
+            if (table == null) {
+                throw new IllegalArgumentException("streaming table not registered: " + ssp.tableName());
+            }
+            base = submitStreamingSimple(ssp, table);
+        } else if (plan instanceof QueryPlanner.ShuffleJoinAggregatePlan sjap) {
             DistributedTable left = tables.get(sjap.leftTable());
             DistributedTable right = tables.get(sjap.rightTable());
             if (left == null || right == null) {
@@ -369,6 +376,33 @@ public final class QueryDispatcher {
         String queryId = UUID.randomUUID().toString().substring(0, 8);
         DispatchResult r = dispatchAndCollect(sql, table, queryId, /*shuffleSpec*/ null);
         return new QueryHandle(queryId, r.assignedAgents, r.queue, r.sub, transport);
+    }
+
+    /**
+     * Phase 6d.1 — long-lived streaming aggregate over a streaming source.
+     * Dispatches ONE scan task with the ORIGINAL SQL; the agent registers
+     * the source with {@code StreamConfig} so jvssql runs the incremental
+     * {@code StreamingAggregate} executor, emitting per-window rows as
+     * the watermark advances.
+     *
+     * <p>MVP scope: single-partition sources only. Multi-partition streaming
+     * needs incremental cross-partition combine (aggregating partial rows
+     * from each partition per window as they arrive) — that's phase 6d.2.
+     * A multi-partition streaming source rejected here with a clear error.</p>
+     *
+     * <p>Termination: no synthetic EOS from the driver. The scan naturally
+     * runs until (a) the source signals end (e.g. {@code InMemoryStreamingTable.stop()})
+     * or (b) the client closes the {@link QueryHandle}, which sends a
+     * {@code CancelMessage} that interrupts the agent's scan.</p>
+     */
+    private QueryHandle submitStreamingSimple(QueryPlanner.StreamingSimplePlan plan, DistributedTable table) {
+        if (table.partitions().size() != 1) {
+            throw new IllegalArgumentException(
+                    "streaming aggregate MVP supports single-partition sources only — table "
+                    + plan.tableName() + " has " + table.partitions().size() + " partitions. "
+                    + "Multi-partition streaming aggregate is phase 6d.2.");
+        }
+        return submitSimple(plan.originalSql(), table);
     }
 
     /**
