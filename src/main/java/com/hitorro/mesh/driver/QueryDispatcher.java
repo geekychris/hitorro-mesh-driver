@@ -1113,16 +1113,45 @@ public final class QueryDispatcher {
         // the stream ended; use unbounded offer for those, bounded for ROWs.
         LinkedBlockingQueue<Object> queue = new LinkedBlockingQueue<>(maxQueueRows());
 
+        // Phase 7k — per-partition retry state. On ERROR from a partition
+        // that hasn't emitted any rows yet, re-dispatch the task on a
+        // (possibly different) eligible agent up to maxTaskRetries times.
+        // Row-emission gates retry to avoid duplicating rows already sent
+        // to the client.
+        int maxTaskRetries = maxTaskRetries();
+        java.util.Map<String, java.util.concurrent.atomic.AtomicInteger> rowsByPartition =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        java.util.Map<String, java.util.concurrent.atomic.AtomicInteger> attemptsByPartition =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        for (var p : parts) {
+            rowsByPartition.put(p.key(), new java.util.concurrent.atomic.AtomicInteger());
+            attemptsByPartition.put(p.key(), new java.util.concurrent.atomic.AtomicInteger(1));
+        }
+
         MeshTransport.Subscription resultSub = transport.subscribe(
                 Subjects.resultsForQuery(queryId),
                 bytes -> {
                     ResultMessage m = Codecs.decode(bytes, ResultMessage.class);
                     switch (m.kind()) {
-                        case ROW -> offerWithBackpressure(queue, m.row(), queryId);
+                        case ROW -> {
+                            var counter = rowsByPartition.get(m.partitionKey());
+                            if (counter != null) counter.incrementAndGet();
+                            offerWithBackpressure(queue, m.row(), queryId);
+                        }
                         case EOS -> {
                             if (remaining.decrementAndGet() == 0) putSentinel(queue, EOS_ALL, queryId);
                         }
                         case ERROR -> {
+                            String pk = m.partitionKey();
+                            var rows = rowsByPartition.get(pk);
+                            var attempt = attemptsByPartition.get(pk);
+                            if (maxTaskRetries > 0 && rows != null && attempt != null
+                                    && rows.get() == 0 && attempt.get() <= maxTaskRetries) {
+                                // Retry: partition emitted zero rows, still have budget.
+                                if (redispatchPartition(table, pk, taskSql, queryId, shuffleSpec, attempt)) {
+                                    return;   // don't propagate; new task's EOS will decrement `remaining`
+                                }
+                            }
                             putSentinel(queue, new QueryError(m.errorMessage()), queryId);
                             putSentinel(queue, EOS_ALL, queryId);
                         }
@@ -1157,6 +1186,52 @@ public final class QueryDispatcher {
             throw e;
         }
         return new DispatchResult(assignedAgents, queue, resultSub);
+    }
+
+    /**
+     * Phase 7k — surgically re-dispatch a single failed partition's task.
+     * Increments the attempt counter, picks a fresh agent (possibly the
+     * same one if only one is eligible), publishes a new task with a
+     * distinct taskId. Returns true if re-dispatched, false if no eligible
+     * agent remained (in which case caller propagates the original error).
+     */
+    private boolean redispatchPartition(DistributedTable table, String partitionKey, String taskSql,
+                                        String queryId, ShuffleSpec shuffleSpec,
+                                        java.util.concurrent.atomic.AtomicInteger attempt) {
+        DistributedTable.Partition p = null;
+        for (var candidate : table.partitions()) {
+            if (candidate.key().equals(partitionKey)) { p = candidate; break; }
+        }
+        if (p == null) return false;
+        Optional<AgentDescriptor> pick = agents.pick(p.requiredCapabilities());
+        if (pick.isEmpty()) return false;
+        int a = attempt.incrementAndGet();
+        AgentDescriptor agent = pick.get();
+        TaskDescriptor td = new TaskDescriptor(
+                queryId,
+                queryId + ":" + partitionKey + ":retry" + a,
+                0,
+                table.name(),
+                partitionKey,
+                taskSql,
+                p.requiredCapabilities(),
+                Subjects.result(queryId, partitionKey),
+                shuffleSpec,
+                null);
+        transport.publish(Subjects.task(agent.agentId()), Codecs.encode(td));
+        org.slf4j.LoggerFactory.getLogger(QueryDispatcher.class).info(
+                "task retry #{} for query {} partition {} → agent {}",
+                a, queryId, partitionKey, agent.agentId());
+        return true;
+    }
+
+    /** Max per-partition retry attempts on transient agent errors. Default 0 = fail-fast. */
+    static int maxTaskRetries() {
+        try {
+            return Integer.parseInt(System.getProperty("hitorro.mesh.driver.max-task-retries", "1"));
+        } catch (NumberFormatException e) {
+            return 1;
+        }
     }
 
     /**
