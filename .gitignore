@@ -1,0 +1,6 @@
+target/
+logs/
+pids/
+.DS_Store
+certs/
+*.log
