@@ -324,7 +324,7 @@ public final class QueryDispatcher {
 
         return (timeout, unit) -> {
             String err = errorRef.get();
-            if (err != null) throw new RuntimeException(err);
+            if (err != null) throw new com.hitorro.mesh.AgentTaskException(err, queryId);
 
             if (!initialised[0]) {
                 initialised[0] = true;
@@ -360,13 +360,14 @@ public final class QueryDispatcher {
         long deadlineNanos = System.nanoTime() + unit.toNanos(timeout);
         while (true) {
             String err = errorRef.get();
-            if (err != null) throw new RuntimeException(err);
+            if (err != null) throw new com.hitorro.mesh.AgentTaskException(err, queryId);
             JsonNode row = q.poll(50, TimeUnit.MILLISECONDS);
             if (row != null) return row;
             if (donePart.contains(partitionKey) && q.isEmpty()) return null;
             if (System.nanoTime() > deadlineNanos) {
-                throw new RuntimeException("timeout waiting for row on partition "
-                        + partitionKey + " of query " + queryId);
+                throw new com.hitorro.mesh.QueryTimeoutException(
+                        "timeout waiting for row on partition "
+                        + partitionKey + " of query " + queryId, queryId);
             }
         }
     }
@@ -387,7 +388,7 @@ public final class QueryDispatcher {
             rows = base.collect(30, TimeUnit.SECONDS);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("interrupted collecting rows for driver-side sort", ie);
+            throw new com.hitorro.mesh.MeshException("interrupted collecting rows for driver-side sort", ie);
         } finally {
             base.close();
         }
@@ -1131,14 +1132,16 @@ public final class QueryDispatcher {
         try {
             while (true) {
                 Object o = queue.poll(10, TimeUnit.SECONDS);
-                if (o == null) throw new RuntimeException("timeout waiting for partial rows");
+                if (o == null) throw new com.hitorro.mesh.QueryTimeoutException(
+                        "timeout waiting for partial rows during driver-side combine", null);
                 if (o == EOS_ALL) return;
-                if (o instanceof QueryError err) throw new RuntimeException(err.message());
+                if (o instanceof QueryError err) throw new com.hitorro.mesh.AgentTaskException(
+                        err.message(), null);
                 out.add((JsonNode) o);
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("interrupted collecting partial rows", ie);
+            throw new com.hitorro.mesh.MeshException("interrupted collecting partial rows", ie);
         }
     }
 
@@ -1247,9 +1250,11 @@ public final class QueryDispatcher {
     private static RowSource queueSource(String queryId, LinkedBlockingQueue<Object> queue) {
         return (timeout, unit) -> {
             Object next = queue.poll(timeout, unit);
-            if (next == null) throw new RuntimeException("timeout waiting for row on query " + queryId);
+            if (next == null) throw new com.hitorro.mesh.QueryTimeoutException(
+                    "timeout waiting for row on query " + queryId, queryId);
             if (next == EOS_ALL) return null;
-            if (next instanceof QueryError err) throw new RuntimeException(err.message());
+            if (next instanceof QueryError err) throw new com.hitorro.mesh.AgentTaskException(
+                    err.message(), queryId);
             return (JsonNode) next;
         };
     }
