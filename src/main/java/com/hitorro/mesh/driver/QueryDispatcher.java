@@ -78,6 +78,34 @@ public final class QueryDispatcher {
     private final LiveAgentRegistry agents;
     private volatile int shuffleWidth = 0;
     private volatile int shuffleWidthCap = 16;
+
+    /**
+     * Phase 7i — configurable backpressure. Result queues are bounded to
+     * this many rows; when the queue is full, the subscription callback
+     * blocks for up to {@link #BACKPRESSURE_OFFER_TIMEOUT_MS} before
+     * dropping the row with a WARN log + counter increment. Prevents
+     * unbounded memory growth when a slow client (or paused streaming
+     * consumer) falls behind a fast-producing source.
+     *
+     * <p>Default 100_000 rows — enough headroom for typical batch queries
+     * while catching runaway streams. Tune via
+     * {@code -Dhitorro.mesh.driver.max-queue-rows}.</p>
+     */
+    static int maxQueueRows() {
+        try {
+            return Integer.parseInt(System.getProperty("hitorro.mesh.driver.max-queue-rows", "100000"));
+        } catch (NumberFormatException e) {
+            return 100_000;
+        }
+    }
+    /** How long to wait for queue space before dropping a row. */
+    static final long BACKPRESSURE_OFFER_TIMEOUT_MS = 1_000L;
+    /** Global drop counter — visible via {@link #backpressureDrops()}. */
+    private final java.util.concurrent.atomic.AtomicLong backpressureDrops =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** Total rows dropped by backpressure across every query on this dispatcher. */
+    public long backpressureDrops() { return backpressureDrops.get(); }
     /** Phase 7b — fires query-timeout close() callbacks. Shared across handles;
      *  each handle scheduling one task, cancelled cleanly on natural close. */
     private final java.util.concurrent.ScheduledExecutorService timeoutScheduler =
@@ -1080,20 +1108,23 @@ public final class QueryDispatcher {
                                               String queryId, ShuffleSpec shuffleSpec) {
         List<DistributedTable.Partition> parts = table.partitions();
         AtomicInteger remaining = new AtomicInteger(parts.size());
-        LinkedBlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+        // Phase 7i — bounded queue for backpressure. Sentinels (EOS_ALL,
+        // QueryError) MUST land even under pressure so the consumer knows
+        // the stream ended; use unbounded offer for those, bounded for ROWs.
+        LinkedBlockingQueue<Object> queue = new LinkedBlockingQueue<>(maxQueueRows());
 
         MeshTransport.Subscription resultSub = transport.subscribe(
                 Subjects.resultsForQuery(queryId),
                 bytes -> {
                     ResultMessage m = Codecs.decode(bytes, ResultMessage.class);
                     switch (m.kind()) {
-                        case ROW -> queue.add(m.row());
+                        case ROW -> offerWithBackpressure(queue, m.row(), queryId);
                         case EOS -> {
-                            if (remaining.decrementAndGet() == 0) queue.add(EOS_ALL);
+                            if (remaining.decrementAndGet() == 0) putSentinel(queue, EOS_ALL, queryId);
                         }
                         case ERROR -> {
-                            queue.add(new QueryError(m.errorMessage()));
-                            queue.add(EOS_ALL);
+                            putSentinel(queue, new QueryError(m.errorMessage()), queryId);
+                            putSentinel(queue, EOS_ALL, queryId);
                         }
                     }
                 });
@@ -1126,6 +1157,41 @@ public final class QueryDispatcher {
             throw e;
         }
         return new DispatchResult(assignedAgents, queue, resultSub);
+    }
+
+    /**
+     * Phase 7i — offer a row into the bounded queue with a bounded wait.
+     * If the queue stays full past {@link #BACKPRESSURE_OFFER_TIMEOUT_MS},
+     * drop the row + WARN + increment counter. Backpressure at this layer
+     * is one-way: the driver just discards; there's no signal upstream to
+     * the agents to slow down (that would need a wire-protocol addition).
+     */
+    private void offerWithBackpressure(LinkedBlockingQueue<Object> queue, Object row, String queryId) {
+        try {
+            if (!queue.offer(row, BACKPRESSURE_OFFER_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                long dropped = backpressureDrops.incrementAndGet();
+                org.slf4j.LoggerFactory.getLogger(QueryDispatcher.class).warn(
+                        "backpressure drop on query {} — queue full for {}ms (total dropped: {})",
+                        queryId, BACKPRESSURE_OFFER_TIMEOUT_MS, dropped);
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Best-effort put for sentinels (EOS, QueryError). Uses {@code put}
+     * to guarantee delivery — otherwise a consumer could wait forever
+     * for an EOS that got dropped by backpressure. Falls back to
+     * silently swallowing on interrupt (shouldn't happen on a
+     * short-lived transport callback).
+     */
+    private static void putSentinel(LinkedBlockingQueue<Object> queue, Object sentinel, String queryId) {
+        try {
+            queue.put(sentinel);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static void drainInto(LinkedBlockingQueue<Object> queue, List<JsonNode> out) {
