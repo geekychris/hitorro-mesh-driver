@@ -29,19 +29,33 @@ import java.util.Set;
  */
 public final class DistributedTableRegistry {
 
+    // Synchronized because phase 7p added runtime add/remove via REST,
+    // which can race with query dispatch (dispatchAndCollect reads tables
+    // during a live query). All mutators + accessors gate on `this`.
     private final Map<String, DistributedTable> tables = new LinkedHashMap<>();
     private final Set<String> broadcastNames = new LinkedHashSet<>();
 
-    public void register(DistributedTable t) {
+    public synchronized void register(DistributedTable t) {
         tables.put(t.name(), t);
     }
 
-    public DistributedTable get(String name) {
+    public synchronized DistributedTable get(String name) {
         return tables.get(name);
     }
 
-    public Collection<DistributedTable> all() {
-        return tables.values();
+    public synchronized Collection<DistributedTable> all() {
+        // Return a snapshot to keep callers safe outside the lock.
+        return new java.util.ArrayList<>(tables.values());
+    }
+
+    /**
+     * Phase 7p — remove a distributed table. In-flight queries against
+     * this table continue with the metadata they already resolved; new
+     * queries fail with the standard "no distributed table registered"
+     * planner error. Returns true if the name existed.
+     */
+    public synchronized boolean remove(String name) {
+        return tables.remove(name) != null;
     }
 
     /**
@@ -51,15 +65,24 @@ public final class DistributedTableRegistry {
      * table is missing on some agent, tasks touching that agent will fail
      * with a clear jvssql error.
      */
-    public void registerBroadcast(String name) {
+    public synchronized void registerBroadcast(String name) {
         broadcastNames.add(name);
     }
 
-    public Set<String> broadcastNames() {
-        return broadcastNames;
+    /**
+     * Phase 7p — deregister a broadcast name. Doesn't affect data on
+     * agents (which continue to hold their pre-loaded tables); just tells
+     * the driver's planner to reject new JOINs against this name.
+     */
+    public synchronized boolean unregisterBroadcast(String name) {
+        return broadcastNames.remove(name);
     }
 
-    public boolean isBroadcast(String name) {
+    public synchronized Set<String> broadcastNames() {
+        return new LinkedHashSet<>(broadcastNames);
+    }
+
+    public synchronized boolean isBroadcast(String name) {
         return broadcastNames.contains(name);
     }
 
@@ -69,7 +92,7 @@ public final class DistributedTableRegistry {
      * planner to route windowed aggregates over these sources to the
      * long-lived streaming plan instead of the batch two-stage plan.
      */
-    public Set<String> streamingTableNames() {
+    public synchronized Set<String> streamingTableNames() {
         Set<String> out = new LinkedHashSet<>();
         for (DistributedTable t : tables.values()) {
             if (t.streamConfig() != null) out.add(t.name());
