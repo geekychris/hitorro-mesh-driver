@@ -439,6 +439,10 @@ public final class QueryDispatcher {
 
         LinkedBlockingQueue<Object> outQueue = new LinkedBlockingQueue<>();
         String windowCol = plan.groupColumns().isEmpty() ? null : plan.groupColumns().get(0);
+        // Phase 6d.2.1: extract windowSize from WIN_START(field, N) so
+        // WATERMARK messages can be converted to "latest closed window
+        // start" for the same close-detection code path as row emissions.
+        long windowSize = extractWindowSize(plan.originalSql());
 
         MeshTransport.Subscription resultSub = transport.subscribe(
                 Subjects.resultsForQuery(queryId),
@@ -454,6 +458,25 @@ public final class QueryDispatcher {
                                 Long prev = partitionLatestWindow.get(pk);
                                 if (prev == null || ws > prev) partitionLatestWindow.put(pk, ws);
                                 emitClosedWindows(buffered, partitionLatestWindow, plan, outQueue, /*drainAll*/ false);
+                            }
+                        }
+                        case WATERMARK -> {
+                            // Convert wm → highest closed window start.
+                            // A window [W, W+size) is closed when wm >= W+size,
+                            // so highest closed W = wm >= size ? ((wm - size) / size) * size : Long.MIN_VALUE.
+                            if (windowSize <= 0) return;
+                            long wm = m.watermarkMs();
+                            long latestClosed = wm >= windowSize
+                                    ? ((wm - windowSize) / windowSize) * windowSize
+                                    : Long.MIN_VALUE;
+                            if (latestClosed == Long.MIN_VALUE) return;
+                            String pk = m.partitionKey();
+                            synchronized (buffered) {
+                                Long prev = partitionLatestWindow.get(pk);
+                                if (prev == null || latestClosed > prev) {
+                                    partitionLatestWindow.put(pk, latestClosed);
+                                    emitClosedWindows(buffered, partitionLatestWindow, plan, outQueue, /*drainAll*/ false);
+                                }
                             }
                         }
                         case EOS -> {
@@ -556,6 +579,27 @@ public final class QueryDispatcher {
             return out;
         } catch (Exception e) {
             throw new RuntimeException("streaming combine failed", e);
+        }
+    }
+
+    /**
+     * Phase 6d.2.1 — extract the tumbling-window size from a
+     * {@code WIN_START(field, N)} call in the SQL. Returns 0 if no such
+     * call is found (in which case the caller falls back to the
+     * emission-only close heuristic).
+     */
+    private static final java.util.regex.Pattern WIN_START_ARG =
+            java.util.regex.Pattern.compile(
+                    "\\bWIN_START\\s*\\(\\s*[^,]+?,\\s*(\\d+)\\s*\\)",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    private static long extractWindowSize(String sql) {
+        java.util.regex.Matcher m = WIN_START_ARG.matcher(sql);
+        if (!m.find()) return 0L;
+        try {
+            return Long.parseLong(m.group(1));
+        } catch (NumberFormatException e) {
+            return 0L;
         }
     }
 
