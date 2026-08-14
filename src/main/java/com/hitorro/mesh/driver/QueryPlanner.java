@@ -350,6 +350,13 @@ public final class QueryPlanner {
         }
         String select = selList.group(2);
 
+        // Phase 6d.2.3 — parse each SELECT item into (expr, alias). If the
+        // user wrote {@code ... AS foo}, {@code foo} becomes the combine
+        // output column. For a bare identifier, the identifier itself is
+        // both expr and alias. Falls back to auto-alias (g0, c0, ...) when
+        // the user didn't supply one on a complex expression.
+        List<SelectItem> selectItems = parseSelectItems(select);
+
         // Extract each aggregate call from the SELECT list, in order. For each,
         // record (a) the partial-column fragments it needs and (b) the combine
         // expression that reduces those partials. This mapping is also used to
@@ -420,6 +427,34 @@ public final class QueryPlanner {
             }
         }
 
+        // Phase 6d.2.3 — map each group col + aggregate to the user's SELECT-side
+        // alias. Group cols matched by normalized-expression equality; aggregates
+        // matched by iteration order (as they appear in the SELECT list).
+        List<String> groupUserAliases = new ArrayList<>();   // parallel to groupPlan
+        for (GroupCol g : groupPlan) {
+            String userAlias = null;
+            for (SelectItem it : selectItems) {
+                if (normalizeExpr(it.expr).equalsIgnoreCase(normalizeExpr(g.partialExpr))) {
+                    userAlias = it.alias;
+                    break;
+                }
+            }
+            groupUserAliases.add(userAlias);
+        }
+        List<String> aggUserAliases = new ArrayList<>();     // parallel to combineDefs
+        int aggSelectIdx = 0;
+        for (int i = 0; i < combineDefs.size(); i++) {
+            String userAlias = null;
+            while (aggSelectIdx < selectItems.size()) {
+                SelectItem it = selectItems.get(aggSelectIdx++);
+                if (AGG_CALL.matcher(it.expr).find()) {
+                    userAlias = it.alias;
+                    break;
+                }
+            }
+            aggUserAliases.add(userAlias);
+        }
+
         // Partial SQL: SELECT <expr AS name | name>, partial-aggs FROM table [WHERE ...] GROUP BY <expr | name>
         // Comma-safe against empty groupPlan (global aggregate case: no
         // GROUP BY, all output is partial aggregates).
@@ -452,20 +487,31 @@ public final class QueryPlanner {
             }
         }
 
-        // Combine SQL: SELECT <combineName>, combine-defs FROM __mesh_partial__ GROUP BY <combineName> [HAVING rewritten]
-        // Same comma-safe pattern as the partial SQL above.
+        // Combine SQL: SELECT <combineName [AS userAlias]>, combine-defs FROM __mesh_partial__ GROUP BY <combineName> [HAVING rewritten]
+        // Phase 6d.2.3: aliases preserved from the user's SELECT list where
+        // provided (e.g. WIN_START(...) AS ws → output as ws). Fallback: the
+        // internal name (g0, c0, ...) is exposed when the user didn't alias.
         List<String> combineNames = groupPlan.stream().map(GroupCol::combineName).toList();
         StringBuilder combineSql = new StringBuilder();
         combineSql.append("SELECT ");
         boolean combineSep = false;
-        for (String n : combineNames) {
+        for (int i = 0; i < combineNames.size(); i++) {
             if (combineSep) combineSql.append(", ");
-            combineSql.append(n);
+            String internal = combineNames.get(i);
+            String userAlias = groupUserAliases.get(i);
+            if (userAlias != null && !userAlias.equalsIgnoreCase(internal)) {
+                combineSql.append(internal).append(" AS ").append(userAlias);
+            } else {
+                combineSql.append(internal);
+            }
             combineSep = true;
         }
-        for (CombineDef d : combineDefs) {
+        for (int i = 0; i < combineDefs.size(); i++) {
+            CombineDef d = combineDefs.get(i);
             if (combineSep) combineSql.append(", ");
-            combineSql.append(d.expr()).append(" AS ").append(d.alias());
+            String userAlias = i < aggUserAliases.size() ? aggUserAliases.get(i) : null;
+            String outAlias = userAlias != null ? userAlias : d.alias();
+            combineSql.append(d.expr()).append(" AS ").append(outAlias);
             combineSep = true;
         }
         combineSql.append(" FROM ").append(COMBINE_INPUT_TABLE);
@@ -516,6 +562,53 @@ public final class QueryPlanner {
     // -- small helpers -------------------------------------------------------
 
     private record CombineDef(String expr, String alias) {}
+
+    /**
+     * Phase 6d.2.3 — one SELECT list item: the expression (possibly a
+     * function call, arithmetic, or a bare identifier) and the alias
+     * (either explicit from {@code AS foo}, or derived from the bare
+     * expression if it's a simple identifier). Null alias means "no
+     * user-supplied alias" — combine SQL falls back to the internal name.
+     */
+    private record SelectItem(String expr, String alias) {}
+
+    private static final Pattern AS_ALIAS =
+            Pattern.compile("^(.+?)\\s+AS\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$",
+                    Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Parse a SELECT list into per-item {@link SelectItem} records. Splits
+     * on top-level commas (paren-safe), then peels off any trailing
+     * {@code AS alias} clause. Bare simple identifiers become their own
+     * alias; complex expressions without AS return null alias.
+     */
+    private static List<SelectItem> parseSelectItems(String selectList) {
+        List<SelectItem> out = new ArrayList<>();
+        for (String raw : splitTopLevel(selectList)) {
+            String item = raw.trim();
+            Matcher m = AS_ALIAS.matcher(item);
+            if (m.matches()) {
+                out.add(new SelectItem(m.group(1).trim(), m.group(2)));
+            } else if (isSimpleColumnRef(item)) {
+                int dot = item.lastIndexOf('.');
+                out.add(new SelectItem(item, dot >= 0 ? item.substring(dot + 1) : item));
+            } else {
+                out.add(new SelectItem(item, null));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Whitespace-normalize an SQL expression for equality comparison —
+     * collapses runs of whitespace and trims, so
+     * {@code "WIN_START(event_time, 60000)"} and
+     * {@code "WIN_START(event_time,60000)"} compare equal. Case is
+     * preserved (users rarely rename by case alone).
+     */
+    private static String normalizeExpr(String expr) {
+        return expr == null ? "" : expr.trim().replaceAll("\\s+", " ").replaceAll("\\s*,\\s*", ",");
+    }
 
     private static java.util.Optional<String> extractWhere(String sql) {
         Matcher m = WHERE_CLAUSE.matcher(sql);
