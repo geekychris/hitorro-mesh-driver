@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -121,12 +122,14 @@ public final class QueryDispatcher {
                 tables.broadcastNames(), distributedNames, tables.streamingTableNames());
 
         QueryHandle base;
-        if (plan instanceof QueryPlanner.StreamingSimplePlan ssp) {
-            DistributedTable table = tables.get(ssp.tableName());
+        if (plan instanceof QueryPlanner.StreamingWindowedPlan swp) {
+            DistributedTable table = tables.get(swp.tableName());
             if (table == null) {
-                throw new IllegalArgumentException("streaming table not registered: " + ssp.tableName());
+                throw new IllegalArgumentException("streaming table not registered: " + swp.tableName());
             }
-            base = submitStreamingSimple(ssp, table);
+            base = table.partitions().size() == 1
+                    ? submitStreamingSingle(swp, table)   // phase 6d.1
+                    : submitStreamingMulti(swp, table);   // phase 6d.2
         } else if (plan instanceof QueryPlanner.ShuffleJoinAggregatePlan sjap) {
             DistributedTable left = tables.get(sjap.leftTable());
             DistributedTable right = tables.get(sjap.rightTable());
@@ -379,30 +382,208 @@ public final class QueryDispatcher {
     }
 
     /**
-     * Phase 6d.1 — long-lived streaming aggregate over a streaming source.
-     * Dispatches ONE scan task with the ORIGINAL SQL; the agent registers
-     * the source with {@code StreamConfig} so jvssql runs the incremental
-     * {@code StreamingAggregate} executor, emitting per-window rows as
-     * the watermark advances.
-     *
-     * <p>MVP scope: single-partition sources only. Multi-partition streaming
-     * needs incremental cross-partition combine (aggregating partial rows
-     * from each partition per window as they arrive) — that's phase 6d.2.
-     * A multi-partition streaming source rejected here with a clear error.</p>
-     *
-     * <p>Termination: no synthetic EOS from the driver. The scan naturally
-     * runs until (a) the source signals end (e.g. {@code InMemoryStreamingTable.stop()})
-     * or (b) the client closes the {@link QueryHandle}, which sends a
-     * {@code CancelMessage} that interrupts the agent's scan.</p>
+     * Phase 6d.1 — single-partition streaming aggregate. Dispatches ONE
+     * scan task with the ORIGINAL SQL; agent's jvssql runs the incremental
+     * {@code StreamingAggregate} directly, per-window rows flow to driver
+     * as watermark advances, driver forwards.
      */
-    private QueryHandle submitStreamingSimple(QueryPlanner.StreamingSimplePlan plan, DistributedTable table) {
-        if (table.partitions().size() != 1) {
-            throw new IllegalArgumentException(
-                    "streaming aggregate MVP supports single-partition sources only — table "
-                    + plan.tableName() + " has " + table.partitions().size() + " partitions. "
-                    + "Multi-partition streaming aggregate is phase 6d.2.");
-        }
+    private QueryHandle submitStreamingSingle(QueryPlanner.StreamingWindowedPlan plan, DistributedTable table) {
         return submitSimple(plan.originalSql(), table);
+    }
+
+    /**
+     * Phase 6d.2 — multi-partition streaming aggregate. Each partition runs
+     * the PARTIAL SQL (still a windowed aggregate via jvssql streaming);
+     * driver receives per-window partial rows and combines them across
+     * partitions incrementally.
+     *
+     * <h4>Window-close detection (advance-past heuristic)</h4>
+     * A window {@code W} is considered globally closed when every partition
+     * has emitted at least one row for a strictly LATER window
+     * ({@code window_start > W}). This works because jvssql's streaming
+     * aggregate emits window {@code X}'s row only after watermark advances
+     * past {@code X}'s end — if partition {@code P} emitted for window
+     * {@code W+windowSize}, its watermark is at least {@code W+2·windowSize},
+     * so {@code W} is definitively closed on {@code P}.
+     *
+     * <h4>Combine math</h4>
+     * When a window closes globally, all buffered partial rows for that
+     * window get registered into a small jvssql engine and the combine SQL
+     * runs over them — same math as phase-2 combiner-at-driver
+     * (SUM for COUNT/SUM, MIN for MIN, MAX for MAX, ratio for AVG). Output
+     * rows are emitted to the user's queue.
+     *
+     * <h4>Caveats</h4>
+     * <ul>
+     *   <li>A partition that never emits (e.g. no events flowing) can
+     *       stall window emission indefinitely. Explicit watermark
+     *       heartbeats would fix this — not in the MVP wire protocol.</li>
+     *   <li>On source-EOS or cancel, all remaining buffered windows are
+     *       flushed unconditionally to the user, then EOS.</li>
+     * </ul>
+     */
+    private QueryHandle submitStreamingMulti(QueryPlanner.StreamingWindowedPlan plan, DistributedTable table) {
+        String queryId = UUID.randomUUID().toString().substring(0, 8);
+        List<DistributedTable.Partition> parts = table.partitions();
+        int nParts = parts.size();
+
+        // Ordered buffer: window_start → list of partial rows. TreeMap so
+        // we can walk closed windows in ascending order and stop early.
+        final java.util.TreeMap<Long, List<JsonNode>> buffered = new java.util.TreeMap<>();
+        // Per-partition tracker: latest window_start observed. When min > W,
+        // window W is globally closed.
+        final java.util.Map<String, Long> partitionLatestWindow = new java.util.HashMap<>();
+        for (var p : parts) partitionLatestWindow.put(p.key(), Long.MIN_VALUE);
+        // EOS bookkeeping — one per partition.
+        final java.util.Set<String> eosReceived = ConcurrentHashMap.newKeySet();
+
+        LinkedBlockingQueue<Object> outQueue = new LinkedBlockingQueue<>();
+        String windowCol = plan.groupColumns().isEmpty() ? null : plan.groupColumns().get(0);
+
+        MeshTransport.Subscription resultSub = transport.subscribe(
+                Subjects.resultsForQuery(queryId),
+                bytes -> {
+                    ResultMessage m = Codecs.decode(bytes, ResultMessage.class);
+                    switch (m.kind()) {
+                        case ROW -> {
+                            JsonNode row = m.row();
+                            String pk = m.partitionKey();
+                            long ws = windowCol == null ? 0L : row.get(windowCol).asLong();
+                            synchronized (buffered) {
+                                buffered.computeIfAbsent(ws, k -> new ArrayList<>()).add(row);
+                                Long prev = partitionLatestWindow.get(pk);
+                                if (prev == null || ws > prev) partitionLatestWindow.put(pk, ws);
+                                emitClosedWindows(buffered, partitionLatestWindow, plan, outQueue, /*drainAll*/ false);
+                            }
+                        }
+                        case EOS -> {
+                            eosReceived.add(m.partitionKey());
+                            if (eosReceived.size() >= nParts) {
+                                synchronized (buffered) {
+                                    emitClosedWindows(buffered, partitionLatestWindow, plan, outQueue, /*drainAll*/ true);
+                                }
+                                outQueue.add(EOS_ALL);
+                            }
+                        }
+                        case ERROR -> {
+                            outQueue.add(new QueryError(m.errorMessage()));
+                            outQueue.add(EOS_ALL);
+                        }
+                    }
+                });
+
+        List<String> assignedAgents = new ArrayList<>();
+        try {
+            for (DistributedTable.Partition p : parts) {
+                Optional<AgentDescriptor> pick = agents.pick(p.requiredCapabilities());
+                if (pick.isEmpty()) {
+                    throw new IllegalStateException("no live agent for capabilities " + p.requiredCapabilities());
+                }
+                AgentDescriptor a = pick.get();
+                assignedAgents.add(a.agentId());
+                TaskDescriptor scan = new TaskDescriptor(
+                        queryId,
+                        queryId + ":stream:" + p.key(),
+                        0,
+                        table.name(),
+                        p.key(),
+                        plan.partialSql(),
+                        p.requiredCapabilities(),
+                        Subjects.result(queryId, p.key()),
+                        null,
+                        null);
+                transport.publish(Subjects.task(a.agentId()), Codecs.encode(scan));
+            }
+        } catch (RuntimeException e) {
+            resultSub.close();
+            throw e;
+        }
+        return new QueryHandle(queryId, assignedAgents, outQueue, resultSub, transport);
+    }
+
+    /**
+     * Walk buffered windows in ascending order; for each closed one, run
+     * combine SQL over its buffered partials and push results onto the
+     * output queue. Removes emitted entries from the buffer. Synchronized
+     * on {@code buffered} by the caller.
+     *
+     * @param drainAll true on EOS — flush every remaining window unconditionally.
+     */
+    private void emitClosedWindows(java.util.TreeMap<Long, List<JsonNode>> buffered,
+                                   java.util.Map<String, Long> partitionLatestWindow,
+                                   QueryPlanner.StreamingWindowedPlan plan,
+                                   LinkedBlockingQueue<Object> outQueue,
+                                   boolean drainAll) {
+        long minLatest = Long.MAX_VALUE;
+        for (Long v : partitionLatestWindow.values()) {
+            if (v == null || v == Long.MIN_VALUE) { minLatest = Long.MIN_VALUE; break; }
+            if (v < minLatest) minLatest = v;
+        }
+        var it = buffered.entrySet().iterator();
+        while (it.hasNext()) {
+            var entry = it.next();
+            long ws = entry.getKey();
+            // "window ws is emittable when every partition has emitted for
+            // window >= ws" → ws <= min(latest emitted per partition).
+            // Missing partitions (Long.MIN_VALUE above) block closure until
+            // they've contributed anything at all.
+            boolean closed = drainAll || ws <= minLatest;
+            if (!closed) return;   // TreeMap ascending → no later entry can be closed either
+            List<JsonNode> partials = entry.getValue();
+            it.remove();
+            for (JsonNode combined : reduceOneWindow(partials, plan)) {
+                outQueue.add(combined);
+            }
+        }
+    }
+
+    /**
+     * Run combine SQL over the partial rows of a single closed window and
+     * return the reduced rows (one per group-key within the window).
+     * Uses a small jvssql engine — same math as phase-2 combiner-at-driver.
+     */
+    private List<JsonNode> reduceOneWindow(List<JsonNode> partials, QueryPlanner.StreamingWindowedPlan plan) {
+        if (partials.isEmpty()) return List.of();
+        Type partialType = synthesizePartialTypeFromRow(partials.get(0));
+        try {
+            JvsSqlEngine engine = JvsSqlEngine.builder()
+                    .registerStream(QueryPlanner.COMBINE_INPUT_TABLE, jvsIterator(partials), partialType)
+                    .build();
+            PreparedQuery cq = engine.compile(plan.combineSql());
+            List<JsonNode> out = new ArrayList<>();
+            Iterator<JsonNode> rows = cq.asIterator();
+            while (rows.hasNext()) out.add(rows.next());
+            return out;
+        } catch (Exception e) {
+            throw new RuntimeException("streaming combine failed", e);
+        }
+    }
+
+    /**
+     * Best-effort type synthesis from the first partial row's fields.
+     * Every field typed as {@code core_long} — sufficient because partial
+     * aggregate outputs are all longs in the MVP (COUNT / SUM are long,
+     * AVG decomposes to SUM+COUNT longs, MIN/MAX over long inputs stay
+     * long). Same limitation as {@code synthesizePartialType} for phase-2.
+     */
+    private static Type synthesizePartialTypeFromRow(JsonNode first) {
+        try {
+            StringBuilder json = new StringBuilder();
+            json.append("{\"name\":\"").append(QueryPlanner.COMBINE_INPUT_TABLE).append("\",\"fields\":[");
+            boolean sep = false;
+            for (var it = first.fieldNames(); it.hasNext(); ) {
+                String n = it.next();
+                if (sep) json.append(",");
+                sep = true;
+                json.append("{\"name\":\"").append(n).append("\",\"type\":\"core_long\"}");
+            }
+            json.append("]}");
+            Type t = new Type();
+            t.init(MAPPER.readTree(json.toString()));
+            return t;
+        } catch (Exception e) {
+            throw new RuntimeException("failed to synthesize streaming partial type", e);
+        }
     }
 
     /**

@@ -129,8 +129,8 @@ public final class QueryPlanner {
             Pattern.compile("\\b(COUNT|SUM|MIN|MAX|AVG)\\s*\\(\\s*(\\*|[^)]+?)\\s*\\)",
                     Pattern.CASE_INSENSITIVE);
 
-    /** Marker interface — {@link SimplePlan}, {@link TwoStagePlan}, {@link ShuffleJoinPlan}, {@link ShuffleJoinAggregatePlan}, or {@link StreamingSimplePlan}. */
-    public sealed interface Plan permits SimplePlan, TwoStagePlan, ShuffleJoinPlan, ShuffleJoinAggregatePlan, StreamingSimplePlan {
+    /** Marker interface — {@link SimplePlan}, {@link TwoStagePlan}, {@link ShuffleJoinPlan}, {@link ShuffleJoinAggregatePlan}, or {@link StreamingWindowedPlan}. */
+    public sealed interface Plan permits SimplePlan, TwoStagePlan, ShuffleJoinPlan, ShuffleJoinAggregatePlan, StreamingWindowedPlan {
         String tableName();
     }
 
@@ -138,22 +138,35 @@ public final class QueryPlanner {
     public record SimplePlan(String tableName) implements Plan {}
 
     /**
-     * Phase 6d.1 — long-lived streaming plan. Used when the source is a
-     * streaming {@link DistributedTable} AND the query is a windowed
-     * aggregate (has {@code WIN_START(...)} or similar in GROUP BY).
+     * Phase 6d.1 / 6d.2 — long-lived windowed streaming plan. Used when
+     * the source is a streaming {@link DistributedTable} AND the query
+     * is a windowed aggregate (has {@code WIN_START(...)} or similar in
+     * GROUP BY).
      *
-     * <p>The agent runs the ORIGINAL SQL verbatim against the streaming
-     * source (with a {@link com.hitorro.jvssql.config.StreamConfig}
-     * registered so jvssql auto-picks the incremental
-     * {@code StreamingAggregate} executor). Windows flush as watermarks
-     * advance; rows emit continuously to the driver via ROW messages.
-     * No cross-partition combine at the driver — MVP is single-partition
-     * streaming aggregate (multi-partition needs incremental
-     * cross-partition combine, deferred to phase 6d.2).</p>
+     * <p>The plan carries BOTH the original SQL (for single-partition
+     * execution — jvssql runs the full windowed aggregate directly) AND
+     * a partial/combine SQL pair (for multi-partition — each partition
+     * runs partial aggregate via streaming, driver reduces per-window
+     * partials across partitions incrementally). The dispatcher picks
+     * the execution shape based on {@code table.partitions().size()}.</p>
+     *
+     * <p>Single-partition path (phase 6d.1): agent runs originalSql,
+     * jvssql streaming aggregate emits per-window rows as watermarks
+     * advance, driver forwards.</p>
+     *
+     * <p>Multi-partition path (phase 6d.2): each partition runs
+     * partialSql (also a streaming aggregate); driver receives per-window
+     * partial rows and combines across partitions using an advance-past
+     * heuristic — a window is globally closed when EVERY partition has
+     * emitted a row for a strictly later window.</p>
      */
-    public record StreamingSimplePlan(
+    public record StreamingWindowedPlan(
             String tableName,
-            String originalSql
+            String originalSql,
+            String partialSql,
+            String combineSql,
+            List<String> groupColumns,
+            List<PartialColumn> partialColumns
     ) implements Plan {}
 
     /**
@@ -273,9 +286,10 @@ public final class QueryPlanner {
                     + " — run this query on a single jvssql engine locally. sql=" + sql);
         }
 
-        // Phase 6d.1: streaming aggregate over a streaming source — route to
-        // the long-lived plan BEFORE hitting the batch two-stage detector.
-        java.util.Optional<StreamingSimplePlan> streaming = tryPlanStreamingAggregate(sql, streamingTables);
+        // Phase 6d.1 / 6d.2: streaming windowed aggregate over a streaming
+        // source — route to the long-lived plan BEFORE hitting the batch
+        // two-stage detector.
+        java.util.Optional<StreamingWindowedPlan> streaming = tryPlanStreamingAggregate(sql, streamingTables);
         if (streaming.isPresent()) return streaming.get();
 
         // Phase 4b: detect fact-x-fact join BEFORE the broadcast-only guard.
@@ -524,18 +538,19 @@ public final class QueryPlanner {
                     Pattern.CASE_INSENSITIVE);
 
     /**
-     * Phase 6d.1 — try to plan a windowed aggregate over a streaming source.
-     * Present only if:
+     * Phase 6d.1 / 6d.2 — try to plan a windowed aggregate over a streaming
+     * source. Present only if:
      * <ul>
      *   <li>The FROM table is in {@code streamingTables}</li>
      *   <li>The GROUP BY contains a window function ({@code WIN_START} etc.)</li>
      *   <li>No JOIN, no HAVING (MVP scope — those need multi-side plumbing)</li>
      * </ul>
-     * The plan carries the ORIGINAL SQL — the agent runs it verbatim against
-     * a streaming-registered jvssql engine so windowed aggregates auto-swap
-     * to incremental emission.
+     * Builds partial/combine SQL via the shared {@link #planTwoStage} helper
+     * so the multi-partition path (phase 6d.2) can reduce per-window partials
+     * across partitions. Single-partition execution (phase 6d.1) uses the
+     * original SQL verbatim, ignoring the partial/combine metadata.
      */
-    private static java.util.Optional<StreamingSimplePlan> tryPlanStreamingAggregate(
+    private static java.util.Optional<StreamingWindowedPlan> tryPlanStreamingAggregate(
             String sql, java.util.Set<String> streamingTables) {
         if (streamingTables.isEmpty()) return java.util.Optional.empty();
         Matcher from = FROM_TABLE.matcher(sql);
@@ -549,7 +564,12 @@ public final class QueryPlanner {
         // over streaming needs cross-side plumbing not yet built.
         if (JOIN_CHAIN.matcher(sql).find()) return java.util.Optional.empty();
         if (HAVING_CLAUSE.matcher(sql).find()) return java.util.Optional.empty();
-        return java.util.Optional.of(new StreamingSimplePlan(tableName, sql));
+        List<String> groupCols = parseGroupCols(gb.group(1).trim());
+        TwoStagePlan inner = planTwoStage(sql, tableName, groupCols, /*having*/ null);
+        return java.util.Optional.of(new StreamingWindowedPlan(
+                tableName, sql,
+                inner.partialSql(), inner.combineSql(),
+                inner.groupColumns(), inner.partialColumns()));
     }
 
     /**
