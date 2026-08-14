@@ -78,6 +78,14 @@ public final class QueryDispatcher {
     private final LiveAgentRegistry agents;
     private volatile int shuffleWidth = 0;
     private volatile int shuffleWidthCap = 16;
+    /** Phase 7b — fires query-timeout close() callbacks. Shared across handles;
+     *  each handle scheduling one task, cancelled cleanly on natural close. */
+    private final java.util.concurrent.ScheduledExecutorService timeoutScheduler =
+            java.util.concurrent.Executors.newScheduledThreadPool(1, r -> {
+                Thread t = new Thread(r, "mesh-driver-query-timeout");
+                t.setDaemon(true);
+                return t;
+            });
 
     public QueryDispatcher(MeshTransport transport,
                            DistributedTableRegistry tables,
@@ -104,6 +112,24 @@ public final class QueryDispatcher {
     public int shuffleWidth() { return shuffleWidth; }
 
     /** Run a distributed query. */
+    /**
+     * Phase 7b — submit with a query-level deadline. If the query hasn't
+     * completed within {@code timeout}, a {@link com.hitorro.mesh.CancelMessage}
+     * is published (interrupting all in-flight agent tasks for this query),
+     * the {@link QueryHandle} is closed, and subsequent {@code nextRow}
+     * calls return {@code null} with {@link QueryHandle#timedOut()} true.
+     *
+     * <p>Zero or negative timeout is treated as "no deadline" — same as
+     * calling {@link #submit(String)}. Callers using this overload should
+     * check {@link QueryHandle#timedOut()} before treating an empty result
+     * as authoritative.</p>
+     */
+    public QueryHandle submit(String sql, java.time.Duration timeout) {
+        QueryHandle h = submit(sql);
+        if (timeout == null || timeout.isZero() || timeout.isNegative()) return h;
+        return h.withTimeout(timeout, timeoutScheduler);
+    }
+
     public QueryHandle submit(String sql) {
         // Phase 5a/5b: strip LIMIT and ORDER BY before planning — both are
         // driver-side concerns. Applied as post-processing so every plan
@@ -1240,21 +1266,31 @@ public final class QueryDispatcher {
          * the base handle and no agents are still running for their queryId.
          */
         private final MeshTransport transport;
+        /** Phase 7b — invoked on close() to unblock any nextRow blocked in
+         *  poll on the underlying queue. Nullable — merge-source handles
+         *  don't own a queue to push to. */
+        private final Runnable onCloseUnblock;
         private long remaining = Long.MAX_VALUE;   // phase 5a: LIMIT cap
-        private boolean closed;
+        private volatile boolean closed;
+        /** Phase 7b — set by the timeout task if the deadline fired before natural close. */
+        private volatile boolean timedOut;
+        /** Cancellable handle for the scheduled timeout (null when no timeout is armed). */
+        private volatile java.util.concurrent.ScheduledFuture<?> timeoutTask;
 
         QueryHandle(String queryId, List<String> agents,
                     LinkedBlockingQueue<Object> queue,
                     MeshTransport.Subscription sub,
                     MeshTransport transport) {
-            this(queryId, agents, queueSource(queryId, queue), sub, transport);
+            this(queryId, agents, queueSource(queryId, queue), sub, transport,
+                    () -> queue.add(EOS_ALL));
         }
 
         /** Legacy 4-arg constructor for internal call sites that don't dispatch to agents. */
         QueryHandle(String queryId, List<String> agents,
                     LinkedBlockingQueue<Object> queue,
                     MeshTransport.Subscription sub) {
-            this(queryId, agents, queue, sub, null);
+            this(queryId, agents, queueSource(queryId, queue), sub, null,
+                    () -> queue.add(EOS_ALL));
         }
 
         /** Pluggable-source constructor (phase 5b.2 N-way merge). */
@@ -1262,11 +1298,20 @@ public final class QueryDispatcher {
                     RowSource source,
                     MeshTransport.Subscription sub,
                     MeshTransport transport) {
+            this(queryId, agents, source, sub, transport, null);
+        }
+
+        QueryHandle(String queryId, List<String> agents,
+                    RowSource source,
+                    MeshTransport.Subscription sub,
+                    MeshTransport transport,
+                    Runnable onCloseUnblock) {
             this.queryId = queryId;
             this.agents = List.copyOf(agents);
             this.source = source;
             this.sub = sub;
             this.transport = transport;
+            this.onCloseUnblock = onCloseUnblock;
         }
 
         public String queryId() { return queryId; }
@@ -1283,8 +1328,37 @@ public final class QueryDispatcher {
             return this;
         }
 
+        /**
+         * Phase 7b — arm a deadline. On expiry, {@link #close()} fires
+         * (which publishes {@code CancelMessage} to the agents), the
+         * {@link #timedOut()} flag flips true, and further
+         * {@link #nextRow(long, TimeUnit)} calls return {@code null} as
+         * if the stream had ended.
+         *
+         * <p>Cancelled cleanly if the handle closes naturally first —
+         * scheduled task doesn't fire after {@link #close()}.</p>
+         */
+        public QueryHandle withTimeout(java.time.Duration timeout,
+                                       java.util.concurrent.ScheduledExecutorService scheduler) {
+            if (timeout == null || timeout.isZero() || timeout.isNegative() || scheduler == null) return this;
+            this.timeoutTask = scheduler.schedule(() -> {
+                if (!closed) {
+                    timedOut = true;
+                    close();
+                }
+            }, timeout.toMillis(), TimeUnit.MILLISECONDS);
+            return this;
+        }
+
+        /** True iff a scheduled query-deadline fired before natural completion. */
+        public boolean timedOut() { return timedOut; }
+
         public JsonNode nextRow(long timeout, TimeUnit unit) throws InterruptedException {
             if (remaining <= 0) return null;
+            // Phase 7b: after close (natural or timeout-triggered), the source
+            // may still have queued rows that arrived just before close — but
+            // the onCloseUnblock has pushed EOS_ALL, so the next source.next()
+            // will hit that and return null cleanly.
             JsonNode row = source.next(timeout, unit);
             if (row == null) return null;
             remaining--;
@@ -1302,6 +1376,17 @@ public final class QueryDispatcher {
         public void close() {
             if (closed) return;
             closed = true;
+            // Phase 7b — cancel any pending timeout task so it doesn't fire
+            // spuriously after natural close.
+            var t = timeoutTask;
+            if (t != null) t.cancel(false);
+            // Phase 7b — unblock any nextRow blocked on the queue (queue-based
+            // handles). Merge-source handles pass null here — they can't
+            // easily push a sentinel through the merge iterator, so a caller
+            // stuck on a merge-source poll will time out on its own budget.
+            if (onCloseUnblock != null) {
+                try { onCloseUnblock.run(); } catch (Throwable ignore) {}
+            }
             // Phase 6c.2: publish cancel BEFORE closing the subscription — that
             // way if the driver receives an EOS from a cancelled agent, we
             // still process it cleanly. Only publish if the handle owns a
