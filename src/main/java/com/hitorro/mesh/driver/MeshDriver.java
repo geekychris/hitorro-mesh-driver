@@ -3,7 +3,10 @@
  */
 package com.hitorro.mesh.driver;
 
+import com.hitorro.mesh.Codecs;
 import com.hitorro.mesh.MeshTransport;
+import com.hitorro.mesh.RegisterTableMessage;
+import com.hitorro.mesh.Subjects;
 
 /**
  * Facade that stitches the driver components together: hand it a
@@ -38,6 +41,19 @@ public final class MeshDriver implements AutoCloseable {
     public DistributedTableRegistry tables() { return tables; }
     public LiveAgentRegistry agents() { return agents; }
     public QueryDispatcher dispatcher() { return dispatcher; }
+
+    /**
+     * Publish a {@link RegisterTableMessage} so every live agent installs
+     * a new table at runtime — no restart. Called by the driver-app after
+     * a {@code /mesh/queries/write} completes when the caller asked to
+     * make the output queryable. Agent-side handling lives in
+     * {@code RuntimeTableInstaller}; agents that don't have that class
+     * on their classpath silently ignore the message (no runtime table
+     * registry mutation).
+     */
+    public void publishRegisterTable(RegisterTableMessage msg) {
+        transport.publish(Subjects.agentControlBroadcast(), Codecs.encode(msg));
+    }
 
     @Override
     public void close() {
