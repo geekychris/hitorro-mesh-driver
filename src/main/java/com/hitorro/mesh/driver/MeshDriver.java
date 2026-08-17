@@ -8,6 +8,7 @@ import com.hitorro.mesh.EnableS3Message;
 import com.hitorro.mesh.MeshTransport;
 import com.hitorro.mesh.RegisterTableMessage;
 import com.hitorro.mesh.Subjects;
+import com.hitorro.mesh.UnregisterTableMessage;
 
 /**
  * Facade that stitches the driver components together: hand it a
@@ -64,6 +65,17 @@ public final class MeshDriver implements AutoCloseable {
      */
     public void publishEnableS3(EnableS3Message msg) {
         transport.publish(Subjects.agentControlEnableS3(), Codecs.encode(msg));
+    }
+
+    /**
+     * Symmetric to {@link #publishRegisterTable} — tells every live agent
+     * to drop a runtime-registered table from its
+     * {@link com.hitorro.mesh.agent.RuntimeTableRegistry}. Combined with
+     * driver-side {@code DistributedTableRegistry.unregisterBroadcast} +
+     * {@code unregister} the whole table disappears from the mesh.
+     */
+    public void publishUnregisterTable(UnregisterTableMessage msg) {
+        transport.publish(Subjects.agentControlUnregisterTable(), Codecs.encode(msg));
     }
 
     @Override
