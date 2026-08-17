@@ -43,6 +43,10 @@ public final class MeshDriver implements AutoCloseable {
     public DistributedTableRegistry tables() { return tables; }
     public LiveAgentRegistry agents() { return agents; }
     public QueryDispatcher dispatcher() { return dispatcher; }
+    /** Exposed so app-side helpers (inventory probes, control messages
+     *  built on top of publish/subscribe) can reach the transport
+     *  without re-plumbing it through Spring. */
+    public MeshTransport transport() { return transport; }
 
     /**
      * Publish a {@link RegisterTableMessage} so every live agent installs
