@@ -4,6 +4,7 @@
 package com.hitorro.mesh.driver;
 
 import com.hitorro.mesh.Codecs;
+import com.hitorro.mesh.EnableS3Message;
 import com.hitorro.mesh.MeshTransport;
 import com.hitorro.mesh.RegisterTableMessage;
 import com.hitorro.mesh.Subjects;
@@ -52,7 +53,17 @@ public final class MeshDriver implements AutoCloseable {
      * registry mutation).
      */
     public void publishRegisterTable(RegisterTableMessage msg) {
-        transport.publish(Subjects.agentControlBroadcast(), Codecs.encode(msg));
+        transport.publish(Subjects.agentControlRegisterTable(), Codecs.encode(msg));
+    }
+
+    /**
+     * Publish an {@link EnableS3Message} so every live agent installs a
+     * MinIO / S3 protocol adapter at runtime. Called by the driver's
+     * MinIO lifecycle service right after it wires its own adapter, so
+     * one click on the driver's "Start MinIO" enables S3 mesh-wide.
+     */
+    public void publishEnableS3(EnableS3Message msg) {
+        transport.publish(Subjects.agentControlEnableS3(), Codecs.encode(msg));
     }
 
     @Override
