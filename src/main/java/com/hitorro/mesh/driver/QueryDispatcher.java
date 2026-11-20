@@ -1368,7 +1368,8 @@ public final class QueryDispatcher {
     private static String typeToJson(Type type) {
         if (type == null) return null;
         JsonNode node = type.getNode();
-        if (node != null) return node.toString();
+        // JsonMappers, not node.toString(): on Jackson 3 the latter throws past 500 nesting levels.
+        if (node != null) return MAPPER.writeValueAsString(node);
         return "{\"name\":\"" + type.getName() + "\",\"fields\":[]}";
     }
 
