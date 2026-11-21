@@ -3,9 +3,10 @@
  */
 package com.hitorro.mesh.driver;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import tools.jackson.databind.JsonNode;
 
 import java.util.List;
+import com.hitorro.util.json.JsonValues;
 
 /**
  * Placement math for the phase-2.5 distributed shuffle. Two decisions the
@@ -72,7 +73,7 @@ public final class ShufflePlacement {
             if (v == null || v.isNull()) {
                 sb.append("\0__NULL__\0");
             } else {
-                sb.append(v.asText());
+                sb.append(JsonValues.asText(v));
             }
         }
         int h = sb.toString().hashCode();

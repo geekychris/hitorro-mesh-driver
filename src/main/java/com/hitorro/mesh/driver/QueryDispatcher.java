@@ -3,8 +3,9 @@
  */
 package com.hitorro.mesh.driver;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import com.hitorro.util.json.JsonMappers;
 import com.hitorro.jsontypesystem.JVS;
 import com.hitorro.jsontypesystem.Type;
 import com.hitorro.jvssql.JvsSqlEngine;
@@ -28,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import com.hitorro.util.json.JsonValues;
 
 /**
  * Splits a query into stages, dispatches per-partition tasks, merges result
@@ -68,7 +70,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class QueryDispatcher {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = JsonMappers.json();
 
     /** Milliseconds to wait for stage-1 subscriptions to establish before dispatching stage-0. */
     private static final long SHUFFLE_READY_GRACE_MS = 200;
@@ -507,7 +509,7 @@ public final class QueryDispatcher {
                         case ROW -> {
                             JsonNode row = m.row();
                             String pk = m.partitionKey();
-                            long ws = windowCol == null ? 0L : row.get(windowCol).asLong();
+                            long ws = windowCol == null ? 0L : JsonValues.asLong(row.get(windowCol));
                             synchronized (buffered) {
                                 buffered.computeIfAbsent(ws, k -> new ArrayList<>()).add(row);
                                 Long prev = partitionLatestWindow.get(pk);
@@ -670,7 +672,7 @@ public final class QueryDispatcher {
             StringBuilder json = new StringBuilder();
             json.append("{\"name\":\"").append(QueryPlanner.COMBINE_INPUT_TABLE).append("\",\"fields\":[");
             boolean sep = false;
-            for (var it = first.fieldNames(); it.hasNext(); ) {
+            for (var it = first.propertyNames().iterator(); it.hasNext(); ) {
                 String n = it.next();
                 if (sep) json.append(",");
                 sep = true;
@@ -717,9 +719,9 @@ public final class QueryDispatcher {
             if (aNull) return 1;         // NULL sorts LAST for ASC — DESC flips it in the caller
             if (bNull) return -1;
             if (a.isNumber() && b.isNumber()) {
-                return Double.compare(a.asDouble(), b.asDouble());
+                return Double.compare(JsonValues.asDouble(a), JsonValues.asDouble(b));
             }
-            return a.asText().compareTo(b.asText());
+            return JsonValues.asText(a).compareTo(JsonValues.asText(b));
         }
     }
 
@@ -1366,7 +1368,8 @@ public final class QueryDispatcher {
     private static String typeToJson(Type type) {
         if (type == null) return null;
         JsonNode node = type.getNode();
-        if (node != null) return node.toString();
+        // JsonMappers, not node.toString(): on Jackson 3 the latter throws past 500 nesting levels.
+        if (node != null) return MAPPER.writeValueAsString(node);
         return "{\"name\":\"" + type.getName() + "\",\"fields\":[]}";
     }
 
